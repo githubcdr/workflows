@@ -1,0 +1,375 @@
+---
+name: Docker Release
+
+# ---------------------------------------------------------------------------
+# Reusable workflow for building, signing, attesting and scanning Docker images.
+#
+# STANDALONE USE  (release / schedule / workflow_dispatch):
+#   Configure per-repo with repository variables (Settings → Variables):
+#     IMAGE_NAME        – image name, e.g. "saltstack"  (falls back to repo name)
+#     IMAGE_TITLE       – OCI title label
+#     IMAGE_DESCRIPTION – OCI description label
+#     IMAGE_URL         – project homepage URL
+#     DOCKERHUB_USERNAME – Docker Hub push user (optional)
+#   And repository secrets:
+#     DOCKERHUB_TOKEN   – Docker Hub access token   (optional)
+#
+# REUSABLE USE  (workflow_call from another repo):
+#   jobs:
+#     release:
+#       uses: <org>/<workflows-repo>/.github/workflows/docker-release.yml@main
+#       with:
+#         image_name: myapp
+#       secrets:
+#         DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+#         DOCKERHUB_TOKEN:    ${{ secrets.DOCKERHUB_TOKEN }}
+# ---------------------------------------------------------------------------
+
+on: # yamllint disable-line rule:truthy
+  release:
+    types: [published]
+  schedule:
+    # Rebuild the latest stable release weekly on Mondays at 03:00 UTC.  # yamllint disable-line rule:comments
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Skip pushing images to registries"
+        required: false
+        type: boolean
+        default: true
+  workflow_call:
+    inputs:
+      image_name:
+        description: "Image name, e.g. 'myapp'. Falls back to vars.IMAGE_NAME then repo name."
+        required: false
+        type: string
+        default: ""
+      image_title:
+        description: "OCI image title label. Falls back to vars.IMAGE_TITLE."
+        required: false
+        type: string
+        default: ""
+      image_description:
+        description: "OCI image description label. Falls back to vars.IMAGE_DESCRIPTION."
+        required: false
+        type: string
+        default: ""
+      image_url:
+        description: "Project homepage URL. Falls back to vars.IMAGE_URL."
+        required: false
+        type: string
+        default: ""
+      dry_run:
+        description: "Skip pushing images to registries"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ---------------------------------------------------------------------------
+# JOB GRAPH
+#
+#   prepare ──► build ──► sign   ─┐
+#                       ├─ attest ─┤──► summary
+#                       └─ scan  ─┘
+# ---------------------------------------------------------------------------
+
+jobs:
+  # ── 1. Resolve tag, push-flag, image name & registry list ──────────────
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      do_push: ${{ steps.flags.outputs.do_push }}
+      image_name: ${{ steps.config.outputs.image_name }}
+      images: ${{ steps.config.outputs.images }}
+      has_dh: ${{ steps.config.outputs.has_dh }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required for tag resolution
+
+      - name: Resolve release tag
+        id: resolve
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            git fetch --tags
+            LATEST_TAG=$(git tag -l --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+            if [ -z "$LATEST_TAG" ]; then
+              echo "::error::No semantic version release tags found."
+              exit 1
+            fi
+            echo "Resolved tag: $LATEST_TAG"
+            echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine push flag
+        id: flags
+        env:
+          EVENT: ${{ github.event_name }}
+          DISPATCH_DRY_RUN: ${{ github.event.inputs.dry_run }}
+          CALL_DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          if { [ "$EVENT" = "workflow_dispatch" ] && [ "$DISPATCH_DRY_RUN" = "true" ]; } || \
+             { [ "$EVENT" = "workflow_call" ]     && [ "$CALL_DRY_RUN" = "true" ]; }; then
+            echo "do_push=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "do_push=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve image configuration
+        id: config
+        env:
+          INPUT_IMAGE_NAME: ${{ inputs.image_name }}
+          VAR_IMAGE_NAME: ${{ vars.IMAGE_NAME }}
+          DH_USER: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME }}
+        run: |
+          # Fall back: input → repo variable → repository name
+          IMAGE_NAME="${INPUT_IMAGE_NAME:-${VAR_IMAGE_NAME:-$(basename "$GITHUB_REPOSITORY")}}"
+          echo "image_name=$IMAGE_NAME" >> "$GITHUB_OUTPUT"
+
+          # Only include Docker Hub when a username is available
+          {
+            echo "images<<EOF"
+            echo "ghcr.io/$GITHUB_REPOSITORY_OWNER/$IMAGE_NAME"
+            [ -n "$DH_USER" ] && echo "docker.io/$DH_USER/$IMAGE_NAME"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # Expose whether Docker Hub credentials are present
+          HAS_DH="false"
+          [ -n "$DH_USER" ] && HAS_DH="true"
+          echo "has_dh=$HAS_DH" >> "$GITHUB_OUTPUT"
+
+  # ── 2. Build multi-arch image and push to registries ───────────────────
+  build:
+    name: Build & Push
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      tags: ${{ steps.meta.outputs.tags }}
+      first_tag: ${{ steps.first_tag.outputs.value }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.prepare.outputs.images }}
+          tags: |
+            type=semver,pattern={{version}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ needs.prepare.outputs.tag }}
+            type=semver,pattern={{major}},value=${{ needs.prepare.outputs.tag }}
+          labels: |
+            maintainer=${{ github.actor }}
+            org.opencontainers.image.title=${{ inputs.image_title || vars.IMAGE_TITLE || needs.prepare.outputs.image_name }}
+            org.opencontainers.image.description=${{ inputs.image_description || vars.IMAGE_DESCRIPTION }}
+            org.opencontainers.image.url=${{ inputs.image_url || vars.IMAGE_URL }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        if: needs.prepare.outputs.do_push == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Docker Hub
+        if: needs.prepare.outputs.do_push == 'true' && needs.prepare.outputs.has_dh == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME || vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ needs.prepare.outputs.do_push == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          sbom: true
+          provenance: mode=max
+
+      - name: Extract primary tag
+        id: first_tag
+        env:
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: echo "value=$(echo "$META_JSON" | jq -r '.tags[0]')" >> "$GITHUB_OUTPUT"
+
+  # ── 3a. Keyless image signing with Sigstore Cosign ─────────────────────
+  sign:
+    name: Sign Image
+    needs: [prepare, build]
+    if: needs.prepare.outputs.do_push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write   # required for OIDC keyless signing
+      packages: write
+
+    steps:
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v4.1.2
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sign all tags with Cosign (keyless OIDC)
+        env:
+          TAGS: ${{ needs.build.outputs.tags }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+        run: echo "${TAGS}" | xargs -I {} cosign sign --yes "{}@${DIGEST}"
+
+  # ── 3b. SLSA build provenance attestation ──────────────────────────────
+  attest:
+    name: Attest Provenance
+    needs: [prepare, build]
+    if: needs.prepare.outputs.do_push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      id-token: write
+      attestations: write
+      packages: write
+
+    steps:
+      - name: Generate SLSA build attestation
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ needs.prepare.outputs.image_name }}
+          subject-digest: ${{ needs.build.outputs.digest }}
+          push-to-registry: true
+
+  # ── 3c. Vulnerability scan with Grype → GitHub Security tab ───────────
+  scan:
+    name: Vulnerability Scan
+    needs: [prepare, build]
+    if: needs.prepare.outputs.do_push == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+      packages: read
+
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Scan image with Grype
+        id: grype
+        uses: anchore/scan-action@v7
+        with:
+          # Pin to exact digest for deterministic scanning
+          image: ghcr.io/${{ github.repository_owner }}/${{ needs.prepare.outputs.image_name }}@${{ needs.build.outputs.digest }}
+          fail-build: false
+          severity-cutoff: critical
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: ${{ steps.grype.outputs.sarif }}
+          category: grype-scan
+
+  # ── 4. Write a Markdown summary to the workflow run page ───────────────
+  summary:
+    name: Summary
+    needs: [prepare, build, sign, attest, scan]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}  # no permissions needed
+
+    steps:
+      - name: Write job summary
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+          DO_PUSH: ${{ needs.prepare.outputs.do_push }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          TAGS: ${{ needs.build.outputs.tags }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SIGN_RESULT: ${{ needs.sign.result }}
+          ATTEST_RESULT: ${{ needs.attest.result }}
+          SCAN_RESULT: ${{ needs.scan.result }}
+        run: |
+          status_icon() {
+            case "$1" in
+              success)  echo "✅" ;;
+              skipped)  echo "⏭️" ;;
+              failure)  echo "❌" ;;
+              *)        echo "⚠️" ;;
+            esac
+          }
+          {
+            echo "## Docker Release"
+            echo ""
+            echo "| Property | Value |"
+            echo "| --- | --- |"
+            echo "| **Event** | \`$GITHUB_EVENT_NAME\` |"
+            echo "| **Tag** | \`${TAG}\` |"
+            echo "| **Pushed** | \`${DO_PUSH}\` |"
+            echo "| **Digest** | \`${DIGEST}\` |"
+            echo ""
+            echo "### Job Results"
+            echo ""
+            echo "| Job | Result |"
+            echo "| --- | --- |"
+            echo "| Build | $(status_icon "$BUILD_RESULT") \`${BUILD_RESULT}\` |"
+            echo "| Sign | $(status_icon "$SIGN_RESULT") \`${SIGN_RESULT}\` |"
+            echo "| Attest | $(status_icon "$ATTEST_RESULT") \`${ATTEST_RESULT}\` |"
+            echo "| Scan | $(status_icon "$SCAN_RESULT") \`${SCAN_RESULT}\` |"
+            echo ""
+            echo "### Published Tags"
+            echo ""
+            echo "\`\`\`"
+            echo "${TAGS}"
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
